@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project specific
+uploads/
+outputs/
+*.pdf
+!README.pdf
+*_全文.md
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+
+# Cache
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node (if any)
+node_modules/
+package-lock.json
