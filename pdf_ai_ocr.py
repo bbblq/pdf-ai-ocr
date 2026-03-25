@@ -360,7 +360,7 @@ def preview_page(task_id, page):
     if page_result is None:
         return jsonify({"success": False, "error": "该页未处理或无结果"})
 
-    return jsonify({"success": True, "page": page, "content": page_result})
+    return jsonify({"success": True, "page": page, "content": clean_text(page_result)})
 
 
 # ============== 处理函数 ==============
@@ -414,14 +414,15 @@ def parse_markdown_table(lines, start_idx):
 
 def clean_text(text):
     """清理文本，移除多余空格、HTML标签和处理中文间隔问题"""
+    if not text:
+        return ""
     # 移除HTML标签
     text = re.sub(r"<[^>]+>", "", text)
     # 处理中文间隔问题：如果一个中文字和下一个中文字之间有空格，去掉
-    # 匹配中文和其他CJK字符，移除它们之间的空格
-    text = re.sub(r"([\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", r"\1", text)
-    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1", text)
-    # 移除连续空格
-    text = re.sub(r" +", " ", text)
+    # 匹配中文和其他CJK字符，移除它们之间的空格（包括普通空格、\xa0不间断空格等）
+    text = re.sub(r"([\u4e00-\u9fff])[\s\xa0]+([\u4e00-\u9fff])", r"\1\2", text)
+    # 移除连续空格（各种空白字符）
+    text = re.sub(r"[\s\xa0]+", " ", text)
     # 移除换行前后的空格
     text = re.sub(r"\n\s+", "\n", text)
     text = re.sub(r"\s+\n", "\n", text)
