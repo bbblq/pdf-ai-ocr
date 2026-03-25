@@ -1,5 +1,5 @@
 """
-PDF AI识别工具 - 支持Ollama和LM Studio
+PDF AI识别工具 - 仅支持LM Studio
 开源项目: https://github.com/bbblq/pdf-ai-ocr
 """
 
@@ -14,7 +14,9 @@ import uuid
 import json
 import time
 import threading
-import re
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max
@@ -26,30 +28,42 @@ os.makedirs(app.config["OUTPUT_FOLDER"], exist_ok=True)
 
 tasks = {}
 
-# ============== 支持的提供商配置 ==============
+# LM Studio 配置
+LM_STUDIO_URL = "http://localhost:1234"
 
-PROVIDERS = {
-    "lmstudio": {
-        "name": "LM Studio",
-        "default_url": "http://localhost:1234",
-        "api_type": "openai_compatible",
+# ============== 预设提示词 ==============
+PRESET_PROMPTS = {
+    "contract": {
+        "name": "📜 合同文档",
+        "prompt": "【严格OCR任务】你只能输出图片中的原始文字，不要做任何解释、总结、改写或发挥。直接逐字输出看到的所有文字内容，包括合同条款、金额、日期、签名等。如有表格，用制表符分隔。禁止添加任何说明。",
     },
-    "ollama": {
-        "name": "Ollama",
-        "default_url": "http://localhost:11434",
-        "api_type": "ollama",
+    "invoice": {
+        "name": "🧾 发票收据",
+        "prompt": "【严格OCR任务】你只能输出图片中的原始文字，不要做任何解释、总结、改写或发挥。直接逐字输出看到的所有数字和文字。如有表格，用制表符分隔。禁止添加任何说明。",
+    },
+    "idcard": {
+        "name": "🪪 身份证/证件",
+        "prompt": "【严格OCR任务】你只能输出图片中的原始文字，不要做任何解释、总结、改写或发挥。直接逐字输出看到的所有字符。禁止添加任何说明。",
+    },
+    "book": {
+        "name": "📚 书籍资料",
+        "prompt": "【严格OCR任务】你只能输出图片中的原始文字，不要做任何解释、总结、改写或发挥。保持原有排版格式，逐字输出。禁止添加任何说明。",
+    },
+    "general": {
+        "name": "📝 通用文档",
+        "prompt": "【严格OCR任务】你只能输出图片中的原始文字，不要做任何解释、总结、改写或发挥。直接逐字输出看到的所有内容。禁止添加任何说明。",
+    },
+    "table": {
+        "name": "📊 表格数据",
+        "prompt": "【严格OCR任务】你只能输出图片中的原始表格数据，不要做任何解释、总结、改写或发挥。用制表符分隔各列，保持行列结构。禁止添加任何说明。",
     },
 }
-
-DEFAULT_PROMPT = """你是专业的文档解析专家。请仔细识别这张图片中的所有内容，完整提取不要省略。
-包括：书名、作者、简介、ISBN、定价、出版社信息、套书介绍等所有内容。
-保持原有结构和格式输出。"""
 
 
 # ============== API接口函数 ==============
 
 
-def get_models_lmstudio(url):
+def get_models(url):
     """获取LM Studio模型列表"""
     try:
         response = requests.get(f"{url}/v1/models", timeout=5)
@@ -61,28 +75,7 @@ def get_models_lmstudio(url):
     return []
 
 
-def get_models_ollama(url):
-    """获取Ollama模型列表"""
-    try:
-        response = requests.get(f"{url}/api/tags", timeout=5)
-        if response.status_code == 200:
-            models = response.json().get("models", [])
-            return [m["name"] for m in models]
-    except:
-        pass
-    return []
-
-
-def get_all_models(provider, url):
-    """获取指定提供商的模型列表"""
-    if provider == "lmstudio":
-        return get_models_lmstudio(url)
-    elif provider == "ollama":
-        return get_models_ollama(url)
-    return []
-
-
-def call_vl_model_lmstudio(url, model_name, image_base64, prompt, max_retries=3):
+def call_vl_model(url, model_name, image_base64, prompt, max_retries=3):
     """调用LM Studio的VL模型"""
     for attempt in range(max_retries):
         try:
@@ -117,10 +110,15 @@ def call_vl_model_lmstudio(url, model_name, image_base64, prompt, max_retries=3)
                 if not content:
                     return "[错误: 模型未返回有效内容]"
                 return content
-            elif "failed to process image" in response.text:
+            elif (
+                "failed to process image" in response.text
+                or "does not support image" in response.text
+            ):
                 return f"[错误: 图片处理失败]"
             else:
-                print(f"  LM Studio API错误: {response.status_code}")
+                print(
+                    f"  LM Studio API错误: {response.status_code} - {response.text[:200]}"
+                )
 
         except requests.exceptions.Timeout:
             print(f"  请求超时")
@@ -133,64 +131,6 @@ def call_vl_model_lmstudio(url, model_name, image_base64, prompt, max_retries=3)
     return "[错误: 无法从LM Studio获取响应]"
 
 
-def call_vl_model_ollama(url, model_name, image_base64, prompt, max_retries=3):
-    """调用Ollama的VL模型"""
-    for attempt in range(max_retries):
-        try:
-            # Ollama使用不同的API格式
-            response = requests.post(
-                f"{url}/api/chat",
-                json={
-                    "model": model_name,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "data": image_base64},
-                                {"type": "text", "text": prompt},
-                            ],
-                        }
-                    ],
-                    "stream": False,
-                    "options": {"num_predict": 4000, "temperature": 0.1},
-                },
-                timeout=180,
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-                content = result.get("message", {}).get("content", "")
-                if not content:
-                    return "[错误: 模型未返回有效内容]"
-                return content
-            else:
-                print(
-                    f"  Ollama API错误: {response.status_code} - {response.text[:100]}"
-                )
-
-        except requests.exceptions.Timeout:
-            print(f"  请求超时")
-        except Exception as e:
-            print(f"  错误: {e}")
-
-        if attempt < max_retries - 1:
-            time.sleep(3)
-
-    return "[错误: 无法从Ollama获取响应]"
-
-
-def call_vl_model(provider, url, model_name, image_base64, prompt, max_retries=3):
-    """根据提供商调用对应的VL模型"""
-    if provider == "lmstudio":
-        return call_vl_model_lmstudio(
-            url, model_name, image_base64, prompt, max_retries
-        )
-    elif provider == "ollama":
-        return call_vl_model_ollama(url, model_name, image_base64, prompt, max_retries)
-    else:
-        return "[错误: 不支持的提供商]"
-
-
 # ============== Flask路由 ==============
 
 
@@ -199,29 +139,11 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
-@app.route("/api/providers", methods=["GET"])
-def get_providers():
-    """获取支持的提供商列表"""
-    return jsonify(
-        {
-            "success": True,
-            "providers": [
-                {"id": k, "name": v["name"], "default_url": v["default_url"]}
-                for k, v in PROVIDERS.items()
-            ],
-        }
-    )
-
-
 @app.route("/api/models", methods=["GET"])
-def get_models():
-    """获取指定提供商的模型列表"""
-    provider = request.args.get("provider", "lmstudio")
-    url = request.args.get(
-        "url", PROVIDERS.get(provider, {}).get("default_url", "http://localhost:1234")
-    )
-
-    models = get_all_models(provider, url)
+def get_models_api():
+    """获取模型列表"""
+    url = request.args.get("url", LM_STUDIO_URL)
+    models = get_models(url)
 
     # 过滤视觉模型
     vision_keywords = [
@@ -237,10 +159,23 @@ def get_models():
     return jsonify(
         {
             "success": True if models else False,
-            "provider": provider,
             "url": url,
             "all_models": models,
             "vision_models": vision_models if vision_models else models[:10],
+        }
+    )
+
+
+@app.route("/api/presets", methods=["GET"])
+def get_preset_prompts():
+    """获取预设提示词列表"""
+    return jsonify(
+        {
+            "success": True,
+            "presets": [
+                {"id": k, "name": v["name"], "prompt": v["prompt"]}
+                for k, v in PRESET_PROMPTS.items()
+            ],
         }
     )
 
@@ -281,7 +216,6 @@ def upload_file():
         "results": {},
         "errors": [],
         "output_file": None,
-        "provider": None,
         "model": None,
     }
 
@@ -300,10 +234,9 @@ def start_processing():
     """开始处理PDF"""
     data = request.json
     task_id = data.get("task_id")
-    provider = data.get("provider", "lmstudio")
     model_name = data.get("model")
-    url = data.get("url") or PROVIDERS.get(provider, {}).get("default_url")
-    prompt = data.get("prompt", DEFAULT_PROMPT)
+    url = data.get("url", LM_STUDIO_URL)
+    prompt = data.get("prompt", "")
 
     if task_id not in tasks:
         return jsonify({"success": False, "error": "任务不存在"})
@@ -312,16 +245,13 @@ def start_processing():
         return jsonify({"success": False, "error": "请选择模型"})
 
     task = tasks[task_id]
-    task["provider"] = provider
     task["model"] = model_name
-    task["url"] = url
-    task["prompt"] = prompt
 
     if task["status"] == "running":
         return jsonify({"success": False, "error": "任务已在运行中"})
 
     thread = threading.Thread(
-        target=process_pdf, args=(task_id, provider, url, model_name, prompt)
+        target=process_pdf, args=(task_id, url, model_name, prompt)
     )
     thread.daemon = True
     thread.start()
@@ -362,18 +292,7 @@ def stream_status(task_id):
 
             if task["current_page"] != last_page:
                 last_page = task["current_page"]
-                yield f"data: {
-                    json.dumps(
-                        {
-                            'current_page': task['current_page'],
-                            'total_pages': task['total_pages'],
-                            'progress': round(
-                                task['current_page'] / task['total_pages'] * 100, 1
-                            ),
-                            'status': task['status'],
-                        }
-                    )
-                }\n\n"
+                yield f"data: {json.dumps({'current_page': task['current_page'], 'total_pages': task['total_pages'], 'progress': round(task['current_page'] / task['total_pages'] * 100, 1), 'status': task['status']})}\n\n"
 
             if task["status"] in ["completed", "error"]:
                 yield f"data: {json.dumps({'done': True, 'status': task['status']})}\n\n"
@@ -396,7 +315,7 @@ def download_result(task_id):
     return send_file(
         task["output_file"],
         as_attachment=True,
-        download_name=f"{Path(task['filename']).stem}_全文.md",
+        download_name=f"{task['id']}_output.docx",
     )
 
 
@@ -417,7 +336,7 @@ def preview_page(task_id, page):
 # ============== 处理函数 ==============
 
 
-def extract_page_as_image(pdf_path, page_num, scale=1.5):
+def extract_page_as_image(pdf_path, page_num, scale=1.0):
     doc = fitz.open(pdf_path)
     page = doc[page_num]
     mat = fitz.Matrix(scale, scale)
@@ -427,47 +346,105 @@ def extract_page_as_image(pdf_path, page_num, scale=1.5):
     return img_bytes
 
 
-def save_results_to_markdown(task):
+def save_results_to_word(task):
+    """保存结果到Word文档"""
     output_file = os.path.join(
         app.config["OUTPUT_FOLDER"],
-        f"{task['id']}_{Path(task['filename']).stem}_全文.md",
+        f"{task['id']}_output.docx",
     )
 
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write(f"# {Path(task['filename']).stem}\n\n")
-        f.write(f"**总页数**: {task['total_pages']}\n")
-        f.write(f"**模型**: {task.get('model', 'N/A')}\n")
-        f.write(f"**提供商**: {task.get('provider', 'N/A')}\n\n")
-        f.write("---\n\n")
+    doc = Document()
 
-        for page_num in sorted(task["results"].keys()):
-            f.write(f"## 第 {page_num + 1} 页\n\n")
-            f.write(task["results"][page_num])
-            f.write("\n\n---\n\n")
+    # 标题
+    title = doc.add_heading(f"PDF识别结果 - {task['filename']}", 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    return output_file
+    # 文档信息
+    info_para = doc.add_paragraph()
+    info_para.add_run(f"总页数: {task['total_pages']}").bold = True
+    info_para.add_run(f"\n模型: {task.get('model', 'N/A')}")
+
+    doc.add_paragraph("─" * 50)
+
+    # 按页添加内容
+    for page_num in sorted(task["results"].keys()):
+        # 页码标题
+        page_heading = doc.add_heading(f"第 {page_num + 1} 页", level=1)
+        page_heading.runs[0].font.size = Pt(12)
+
+        # 内容 - 统一字体大小
+        content = task["results"][page_num]
+        if content.startswith("[错误:") or content.startswith("[Error:"):
+            p = doc.add_paragraph(content)
+            p.runs[0].font.size = Pt(11)
+        else:
+            lines = content.split("\n")
+            for line in lines:
+                line = line.strip()
+                if line:
+                    p = doc.add_paragraph(line)
+                    for run in p.runs:
+                        run.font.size = Pt(11)
+
+        doc.add_paragraph()
+
+    try:
+        doc.save(output_file)
+        print(f"文件已保存: {output_file}")
+        return output_file
+    except Exception as e:
+        print(f"保存文件失败: {e}")
+        raise e
 
 
-def process_pdf(task_id, provider, url, model_name, prompt):
+def process_pdf(task_id, url, model_name, prompt):
     task = tasks[task_id]
     task["status"] = "running"
 
     try:
+        # 先测试模型是否支持图片
+        print(f"  测试模型 {model_name} 是否支持图片...")
+        test_img = extract_page_as_image(task["filepath"], 0, scale=0.5)
+        test_base64 = base64.b64encode(test_img).decode("utf-8")
+        test_result = call_vl_model(url, model_name, test_base64, "hi", max_retries=1)
+
+        if "不支持" in test_result or "does not support" in test_result:
+            task["status"] = "error"
+            task["errors"].append(f"模型 {model_name} 不支持图片输入，请使用VL模型")
+            return
+
+        print(f"  模型测试通过，开始处理...")
+
         for i in range(task["total_pages"]):
             task["current_page"] = i
 
             try:
-                img_bytes = extract_page_as_image(task["filepath"], i)
+                img_bytes = extract_page_as_image(task["filepath"], i, scale=1.0)
                 img_base64 = base64.b64encode(img_bytes).decode("utf-8")
-                result = call_vl_model(provider, url, model_name, img_base64, prompt)
-                task["results"][i] = result
-            except Exception as e:
-                task["errors"].append(f"第{i + 1}页: {str(e)}")
-                task["results"][i] = f"[Error: {e}]"
+                result = call_vl_model(url, model_name, img_base64, prompt)
 
-            time.sleep(0.3)
+                if "图片处理失败" in result or "不支持" in result:
+                    print(f"  第{i + 1}页处理失败，尝试更低清晰度...")
+                    img_bytes = extract_page_as_image(task["filepath"], i, scale=0.75)
+                    img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                    result = call_vl_model(url, model_name, img_base64, prompt)
 
-        task["output_file"] = save_results_to_markdown(task)
+                if "图片处理失败" in result or "不支持" in result:
+                    print(f"  第{i + 1}页再次失败，尝试最低清晰度...")
+                    img_bytes = extract_page_as_image(task["filepath"], i, scale=0.5)
+                    img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                    result = call_vl_model(url, model_name, img_base64, prompt)
+
+                # 检查是否是错误结果，如果是则标记为失败
+                if result.startswith("[错误:") or result.startswith("[Error:") or "不支持" in result or "does not support" in result:
+                    task["errors"].append(f"第{i + 1}页: {result}")
+                    task["results"][i] = f"[第{i+1}页识别失败]"
+                else:
+                    task["results"][i] = result
+
+            time.sleep(1.0)
+
+        task["output_file"] = save_results_to_word(task)
         task["status"] = "completed"
 
     except Exception as e:
@@ -483,13 +460,12 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PDF AI识别工具 - 多后端支持</title>
+    <title>PDF AI识别工具</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; padding: 20px; }
         .container { max-width: 900px; margin: 0 auto; }
         h1 { text-align: center; color: #333; margin-bottom: 30px; }
-        h1 .subtitle { font-size: 14px; color: #888; font-weight: normal; }
         
         .card { background: white; border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
         .card h2 { color: #666; font-size: 16px; margin-bottom: 16px; border-bottom: 1px solid #eee; padding-bottom: 10px; }
@@ -514,11 +490,10 @@ HTML_TEMPLATE = """
         .upload-area .text { color: #666; }
         .upload-area .text strong { color: #4a90d9; }
         
-        .file-info { background: #f8f8f8; padding: 16px; border-radius: 6px; margin-top: 16px; display: none; }
-        .file-info.show { display: block; }
-        .file-info .name { font-weight: 500; color: #333; }
-        .file-info .pages { color: #4a90d9; font-size: 13px; }
-        .file-info .size { color: #888; font-size: 13px; margin-top: 4px; }
+        .file-list { margin-top: 16px; }
+        .file-item { background: #f8f8f8; padding: 12px 16px; border-radius: 6px; margin-bottom: 8px; }
+        .file-item .name { font-weight: 500; color: #333; }
+        .file-item .info { color: #4a90d9; font-size: 13px; }
         
         .progress-container { margin-top: 20px; display: none; }
         .progress-container.show { display: block; }
@@ -543,27 +518,19 @@ HTML_TEMPLATE = """
         .model-item:hover { background: #f0f0f0; }
         .model-item.selected { background: #e3f2fd; color: #1976d2; }
         
-        .provider-tabs { display: flex; gap: 8px; margin-bottom: 16px; }
-        .provider-tab { padding: 8px 16px; border: 1px solid #ddd; border-radius: 6px; cursor: pointer; background: white; }
-        .provider-tab.active { background: #4a90d9; color: white; border-color: #4a90d9; }
-        
-        .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; background: #e0e0e0; color: #666; margin-left: 8px; }
-        .badge.lmstudio { background: #ff6b6b; color: white; }
-        .badge.ollama { background: #4ecdc4; color: white; }
+        .preset-select { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+        .preset-btn { padding: 8px 16px; border: 1px solid #ddd; border-radius: 20px; background: white; cursor: pointer; font-size: 13px; transition: all 0.2s; }
+        .preset-btn:hover { border-color: #4a90d9; }
+        .preset-btn.active { background: #4a90d9; color: white; border-color: #4a90d9; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>📄 PDF AI识别工具 <span class="subtitle">- 支持Ollama/LM Studio</span></h1>
+        <h1>📄 PDF AI识别工具</h1>
         
-        <!-- 提供商选择 -->
+        <!-- LM Studio 配置 -->
         <div class="card">
-            <h2>⚙️ 选择AI提供商</h2>
-            <div class="provider-tabs">
-                <div class="provider-tab active" onclick="selectProvider('lmstudio')">LM Studio <span class="badge lmstudio">推荐</span></div>
-                <div class="provider-tab" onclick="selectProvider('ollama')">Ollama</div>
-            </div>
-            
+            <h2>⚙️ LM Studio 配置</h2>
             <div class="form-group">
                 <label>API地址</label>
                 <input type="text" id="apiUrl" value="http://localhost:1234" placeholder="http://localhost:1234">
@@ -584,23 +551,24 @@ HTML_TEMPLATE = """
         <div class="card">
             <h2>📤 上传PDF文件</h2>
             <div class="upload-area" onclick="document.getElementById('fileInput').click()">
-                <input type="file" id="fileInput" accept=".pdf" onchange="handleFileSelect(event)">
+                <input type="file" id="fileInput" accept=".pdf" multiple onchange="handleFileSelect(event)">
                 <div class="icon">📄</div>
-                <div class="text">点击或拖拽PDF文件到这里<br><strong>支持最多500MB的PDF</strong></div>
+                <div class="text">点击或拖拽PDF文件到这里<br><strong>支持批量上传多个PDF</strong></div>
             </div>
-            <div class="file-info" id="fileInfo">
-                <div class="name" id="fileName"></div>
-                <div class="pages" id="filePages"></div>
-                <div class="size" id="fileSize"></div>
-            </div>
+            <div class="file-list" id="fileList"></div>
         </div>
         
-        <!-- 提示词 -->
+        <!-- 提示词预设 -->
         <div class="card">
-            <h2>💬 识别提示词（可选）</h2>
+            <h2>💬 识别提示词</h2>
             <div class="form-group">
-                <textarea id="prompt">你是专业的文档解析专家。请仔细识别这张图片中的所有内容，完整提取不要省略。包括：书名、作者、简介、ISBN、定价、出版社信息、套书介绍等所有内容。保持原有结构和格式输出。</textarea>
-                <small>默认已填写通用提示词，可根据需要修改</small>
+                <label>选择预设模板（点击应用）</label>
+                <div class="preset-select" id="presetSelect"></div>
+            </div>
+            <div class="form-group">
+                <label>自定义提示词</label>
+                <textarea id="prompt" placeholder="选择一个预设模板，或手动输入提示词..."></textarea>
+                <small>提示：工具会原样识别文档内容，不会进行AI总结。</small>
             </div>
         </div>
         
@@ -633,23 +601,9 @@ HTML_TEMPLATE = """
     
     <script>
         let currentTaskId = null;
-        let currentProvider = 'lmstudio';
         let eventSource = null;
         let lastPreviewPage = 0;
-        
-        function selectProvider(provider) {
-            currentProvider = provider;
-            document.querySelectorAll('.provider-tab').forEach(tab => tab.classList.remove('active'));
-            event.target.closest('.provider-tab').classList.add('active');
-            
-            // 更新默认URL
-            if (provider === 'lmstudio') {
-                document.getElementById('apiUrl').value = 'http://localhost:1234';
-            } else {
-                document.getElementById('apiUrl').value = 'http://localhost:11434';
-            }
-            loadModels();
-        }
+        let presets = [];
         
         async function loadModels() {
             const url = document.getElementById('apiUrl').value;
@@ -657,19 +611,44 @@ HTML_TEMPLATE = """
             modelList.innerHTML = '<div class="model-item">加载中...</div>';
             
             try {
-                const resp = await fetch(`/api/models?provider=${currentProvider}&url=${encodeURIComponent(url)}`);
+                const resp = await fetch(`/api/models?url=${encodeURIComponent(url)}`);
                 const data = await resp.json();
                 
                 if (data.success && data.all_models.length > 0) {
                     const models = data.vision_models || data.all_models;
                     modelList.innerHTML = models.map(m => 
-                        `<div class="model-item" onclick="selectModel(this, '${m.replace(/'/g, "\\'")}')">${m}</div>`
+                        `<div class="model-item" onclick="selectModel(this, '${m.replace(/'/g, "\\\\'")}')">${m}</div>`
                     ).join('');
                 } else {
-                    modelList.innerHTML = `<div class="model-item">未检测到模型，请确保${currentProvider === 'lmstudio' ? 'LM Studio' : 'Ollama'}正在运行</div>`;
+                    modelList.innerHTML = '<div class="model-item">未检测到模型，请确保LM Studio正在运行</div>';
                 }
             } catch (e) {
                 modelList.innerHTML = `<div class="model-item">连接失败: ${e.message}</div>`;
+            }
+        }
+        
+        async function loadPresets() {
+            try {
+                const resp = await fetch('/api/presets');
+                const data = await resp.json();
+                if (data.success) {
+                    presets = data.presets;
+                    const container = document.getElementById('presetSelect');
+                    container.innerHTML = presets.map(p => 
+                        `<div class="preset-btn" onclick="selectPreset('${p.id}')">${p.name}</div>`
+                    ).join('');
+                }
+            } catch (e) {
+                console.error('加载预设失败:', e);
+            }
+        }
+        
+        function selectPreset(presetId) {
+            const preset = presets.find(p => p.id === presetId);
+            if (preset) {
+                document.getElementById('prompt').value = preset.prompt;
+                document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
+                event.target.classList.add('active');
             }
         }
         
@@ -680,31 +659,38 @@ HTML_TEMPLATE = """
         }
         
         function handleFileSelect(event) {
-            const file = event.target.files[0];
-            if (!file) return;
+            const files = Array.from(event.target.files);
+            if (!files.length) return;
             
+            const fileList = document.getElementById('fileList');
+            fileList.innerHTML = '';
+            
+            let html = '';
+            files.forEach((file, index) => {
+                html += `<div class="file-item">
+                    <div>
+                        <div class="name">${file.name}</div>
+                        <div class="info">等待上传...</div>
+                    </div>
+                </div>`;
+            });
+            fileList.innerHTML = html;
+            
+            // 上传第一个文件
             const formData = new FormData();
-            formData.append('file', file);
+            formData.append('file', files[0]);
             
             fetch('/api/upload', { method: 'POST', body: formData })
                 .then(r => r.json())
                 .then(data => {
                     if (data.success) {
                         currentTaskId = data.task_id;
-                        document.getElementById('fileName').textContent = data.filename;
-                        document.getElementById('filePages').textContent = `共 ${data.total_pages} 页`;
-                        document.getElementById('fileSize').textContent = formatSize(file.size);
-                        document.getElementById('fileInfo').classList.add('show');
+                        fileList.querySelector('.info').textContent = `已上传 - 共 ${data.total_pages} 页`;
                         document.getElementById('startBtn').disabled = false;
                     } else {
                         alert('上传失败: ' + data.error);
                     }
                 });
-        }
-        
-        function formatSize(bytes) {
-            if (bytes > 1024*1024) return (bytes/1024/1024).toFixed(1) + ' MB';
-            return (bytes/1024).toFixed(1) + ' KB';
         }
         
         function startProcessing() {
@@ -724,7 +710,6 @@ HTML_TEMPLATE = """
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
                     task_id: currentTaskId,
-                    provider: currentProvider,
                     model: model,
                     url: url,
                     prompt: prompt
@@ -809,20 +794,22 @@ HTML_TEMPLATE = """
         function nextPage() { loadPreview(lastPreviewPage + 1); }
         function downloadResult() { window.location.href = `/api/download/${currentTaskId}`; }
         
-        window.onload = loadModels;
+        window.onload = function() {
+            loadModels();
+            loadPresets();
+        };
     </script>
 </body>
 </html>
 """
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("PDF AI识别工具 - 多后端支持版")
+    print("=" * 50)
+    print("PDF AI识别工具 - 仅支持LM Studio")
     print()
-    print("支持的提供商:")
-    print("  - LM Studio (默认: http://localhost:1234)")
-    print("  - Ollama (默认: http://localhost:11434)")
+    print("请确保LM Studio正在运行")
+    print("默认地址: http://localhost:1234")
     print()
     print("请打开浏览器访问: http://localhost:5000")
-    print("=" * 60)
+    print("=" * 50)
     app.run(host="0.0.0.0", port=5000, debug=False)

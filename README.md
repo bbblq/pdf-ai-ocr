@@ -1,57 +1,39 @@
 # PDF AI OCR
 
-基于本地VL模型（视觉语言模型）的PDF内容识别工具，支持Ollama和LM Studio作为后端。
+基于本地VL模型（视觉语言模型）的PDF内容识别工具，仅支持LM Studio作为后端。
 
 ## 功能特点
 
-- 🌐 **多后端支持**: Ollama / LM Studio
 - 📄 **逐页AI识别**: 将PDF每页转为图片，使用VL模型识别
-- 📊 **保持原有格式**: 完整提取书名、作者、ISBN、定价、简介等信息
+- 📊 **原样输出**: 严格OCR模式，不做总结改写，完整保留原文
+- 📝 **多预设模板**: 合同、发票、证件、书籍、表格等常用场景
+- 📥 **Word输出**: 识别结果直接导出为Word文档
+- 📤 **批量处理**: 支持一次性上传多个PDF文件
 - ⚡ **实时进度**: Web界面实时显示处理进度
 - 👁️ **结果预览**: 处理过程中即可预览已识别内容
-- 📥 **一键下载**: 处理完成后直接下载Markdown文件
 
 ## 支持的模型
 
-推荐使用具有图像识别能力的VL模型：
+推荐使用具有图像识别能力的VL模型（仅支持LM Studio）：
 
-### LM Studio
-- `qwen3-vl-8b-instruct`
+- `qwen3-vl-8b` ⭐ **推荐**
 - `qwen2-vl-7b-instruct`
 - `llava` 系列
 - `llama3.2-vision`
-
-### Ollama
-- `llama3.2-vision:latest`
-- `qwen2.5-vl:latest`
-- `llava:latest`
 
 ## 快速开始
 
 ### 1. 安装依赖
 
 ```bash
-pip install flask pymupdf requests
+pip install -r requirements.txt
 ```
 
-### 2. 启动LM Studio或Ollama
+### 2. 启动LM Studio
 
-**LM Studio:**
 1. 下载 [LM Studio](https://lmstudio.ai/)
-2. 下载VL模型（如 qwen3-vl-8b-instruct）
+2. 下载VL模型（如 `qwen3-vl-8b`）
 3. 启动本地服务器 (默认 http://localhost:1234)
-
-**Ollama:**
-```bash
-# 安装Ollama
-curl -fsSL https://ollama.com/install.sh | sh
-
-# 下载VL模型
-ollama pull llama3.2-vision
-
-# 启动服务 (默认 http://localhost:11434)
-ollama serve
-```
 
 ### 3. 运行工具
 
@@ -65,22 +47,36 @@ python pdf_ai_ocr.py
 
 ## 使用方法
 
-1. **选择提供商**: 点击 "LM Studio" 或 "Ollama" 标签
-2. **配置地址**: 确认API地址正确（默认已填充）
-3. **刷新模型**: 点击刷新按钮加载可用模型列表
-4. **选择模型**: 从列表中选择VL模型
-5. **上传PDF**: 点击上传区域选择PDF文件
-6. **开始识别**: 点击"开始识别"按钮
-7. **预览下载**: 处理完成后可预览或下载结果
+1. **刷新模型**: 点击刷新按钮加载可用VL模型
+2. **选择模型**: 从列表中选择一个VL模型
+3. **上传PDF**: 点击上传区域选择PDF文件（支持批量）
+4. **选择预设**: 选择识别场景预设模板（合同/发票/证件等）
+5. **开始识别**: 点击开始识别按钮
+6. **预览下载**: 处理完成后可预览或下载Word文档
+
+## 预设提示词
+
+工具内置多种预设模板：
+
+| 预设 | 适用场景 |
+|------|----------|
+| 📜 合同文档 | 合同条款、双方信息、金额、日期、签名 |
+| 🧾 发票收据 | 发票号码、日期、金额、商品明细 |
+| 🪪 身份证/证件 | 姓名、性别、民族、出生日期、地址、身份证号 |
+| 📚 书籍资料 | 书名、作者、出版社、ISBN、目录、正文 |
+| 📝 通用文档 | 任意文档的纯OCR识别 |
+| 📊 表格数据 | 保持行列结构的表格识别 |
+
+所有预设都采用**严格OCR指令**，确保模型只输出原文，不做任何总结或发挥。
 
 ## 目录结构
 
 ```
 pdf-ai-ocr/
 ├── pdf_ai_ocr.py      # 主程序（Web界面）
+├── requirements.txt    # Python依赖
 ├── Dockerfile         # Docker部署文件
 ├── docker-compose.yml # Docker Compose配置
-├── requirements.txt   # Python依赖
 ├── README.md          # 本文档
 └── .dockerignore      # Docker忽略文件
 ```
@@ -109,27 +105,21 @@ docker run -d -p 5000:5000 \
   pdf-ai-ocr
 ```
 
-> 注意: Docker方式运行需要宿主机的Ollama/LM Studio服务在同一台机器上。
+> 注意: Docker方式运行需要宿主机的LM Studio服务在同一台机器上。
 
-## 常用命令
+## 常见问题
 
-### LM Studio
-```bash
-# 启动LM Studio后，在Settings -> Server中启用
-# 默认地址: http://localhost:1234
-```
+### Q: 提示"模型不支持图像处理"
+A: 请确认已加载VL模型（带vl/vision/llava关键词的模型），普通文本模型无法处理图像。
 
-### Ollama
-```bash
-# 查看已安装模型
-ollama list
+### Q: 模型不听话，输出总结而不是原文
+A: 请使用内置预设模板，或在自定义提示词中明确写"禁止添加任何说明，只输出原文"。
 
-# 运行模型测试
-ollama run llama3.2-vision
+### Q: 处理速度慢
+A: 可以尝试降低PDF图片清晰度（代码中默认scale=1.0），或使用更小的VL模型。
 
-# API方式调用
-curl http://localhost:11434/api/generate -d '{"model":"llama3.2-vision","prompt":"Hello"}'
-```
+### Q: 内存不足导致部分页面识别失败
+A: 这是LM Studio的KV缓存问题，建议在LM Studio中降低Context Length设置，或使用更大的VL模型。
 
 ## API接口
 
@@ -137,41 +127,14 @@ curl http://localhost:11434/api/generate -d '{"model":"llama3.2-vision","prompt"
 - `GET /` - Web界面
 
 ### REST API
-- `GET /api/providers` - 获取支持的提供商列表
-- `GET /api/models?provider=lmstudio&url=http://localhost:1234` - 获取模型列表
+- `GET /api/models?url=http://localhost:1234` - 获取模型列表
+- `GET /api/presets` - 获取预设提示词列表
 - `POST /api/upload` - 上传PDF文件
 - `POST /api/start` - 开始处理
 - `GET /api/status/<task_id>` - 获取处理状态
 - `GET /api/stream/<task_id>` - SSE进度流
-- `GET /api/download/<task_id>` - 下载结果
+- `GET /api/download/<task_id>` - 下载结果（Word文档）
 - `GET /api/preview/<task_id>/<page>` - 预览指定页
-
-## 配置说明
-
-### 环境变量
-- `FLASK_HOST` - 监听地址 (默认: 0.0.0.0)
-- `FLASK_PORT` - 监听端口 (默认: 5000)
-
-### 提示词自定义
-
-在Web界面中可自定义识别提示词，默认提示词:
-
-```
-你是专业的文档解析专家。请仔细识别这张图片中的所有内容，完整提取不要省略。
-包括：书名、作者、简介、ISBN、定价、出版社信息、套书介绍等所有内容。
-保持原有结构和格式输出。
-```
-
-## 常见问题
-
-### Q: 提示"模型不支持图像处理"
-A: 请确认已加载VL模型（带vl/vision/llava关键词的模型），普通文本模型无法处理图像。
-
-### Q: 处理速度慢
-A: 可以尝试降低PDF图片分辨率（修改代码中`scale=1.5`为更小的值），或使用更小的VL模型。
-
-### Q: 如何处理纯文字PDF？
-A: 如果PDF本身有文字层，可以直接使用`pdf_extractor.py`提取文字，速度更快。
 
 ## License
 
