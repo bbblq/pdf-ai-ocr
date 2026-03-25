@@ -4,6 +4,7 @@ PDF AI识别工具 - 仅支持LM Studio
 """
 
 import os
+import re
 import base64
 import requests
 import fitz
@@ -14,6 +15,7 @@ import uuid
 import json
 import time
 import threading
+import docx
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -217,6 +219,7 @@ def upload_file():
         "errors": [],
         "output_file": None,
         "model": None,
+        "stop_flag": False,
     }
 
     return jsonify(
@@ -259,6 +262,20 @@ def start_processing():
     return jsonify({"success": True, "message": "处理已开始"})
 
 
+@app.route("/api/stop/<task_id>", methods=["POST"])
+def stop_processing(task_id):
+    """停止处理"""
+    if task_id not in tasks:
+        return jsonify({"success": False, "error": "任务不存在"})
+
+    task = tasks[task_id]
+    if task["status"] == "running":
+        task["stop_flag"] = True
+        return jsonify({"success": True, "message": "已发送停止信号"})
+
+    return jsonify({"success": False, "error": "任务不在运行中"})
+
+
 @app.route("/api/status/<task_id>")
 def get_status(task_id):
     if task_id not in tasks:
@@ -290,12 +307,17 @@ def stream_status(task_id):
 
             task = tasks[task_id]
 
-            if task["current_page"] != last_page:
-                last_page = task["current_page"]
-                yield f"data: {json.dumps({'current_page': task['current_page'], 'total_pages': task['total_pages'], 'progress': round(task['current_page'] / task['total_pages'] * 100, 1), 'status': task['status']})}\n\n"
+            current = task["current_page"] or 0
+            total = task["total_pages"] or 1
+
+            if current != last_page:
+                last_page = current
+                progress = round(current / total * 100, 1) if total > 0 else 0
+                yield f"data: {json.dumps({'current_page': current, 'total_pages': total, 'progress': progress, 'status': task['status']})}\n\n"
 
             if task["status"] in ["completed", "error"]:
-                yield f"data: {json.dumps({'done': True, 'status': task['status']})}\n\n"
+                # 最终状态也要发送页面信息
+                yield f"data: {json.dumps({'done': True, 'current_page': current, 'total_pages': total, 'progress': 100 if task['status'] == 'completed' else 0, 'status': task['status']})}\n\n"
                 break
 
             time.sleep(0.5)
@@ -305,18 +327,26 @@ def stream_status(task_id):
 
 @app.route("/api/download/<task_id>")
 def download_result(task_id):
+    """下载结果文件，支持docx和md格式"""
+    fmt = request.args.get("format", "docx")
+
     if task_id not in tasks:
         return jsonify({"success": False, "error": "任务不存在"})
 
     task = tasks[task_id]
-    if not task["output_file"] or not os.path.exists(task["output_file"]):
+
+    if fmt == "md":
+        # 生成Markdown文件
+        output_file = save_results_to_markdown(task)
+    else:
+        # 生成Word文件
+        output_file = save_results_to_word(task)
+
+    if not output_file or not os.path.exists(output_file):
         return jsonify({"success": False, "error": "文件不存在"})
 
-    return send_file(
-        task["output_file"],
-        as_attachment=True,
-        download_name=f"{task['id']}_output.docx",
-    )
+    filename = f"{task['id']}_output.{fmt}"
+    return send_file(output_file, as_attachment=True, download_name=filename)
 
 
 @app.route("/api/preview/<task_id>/<int:page>")
@@ -346,6 +376,94 @@ def extract_page_as_image(pdf_path, page_num, scale=1.0):
     return img_bytes
 
 
+def is_markdown_table(lines, start_idx):
+    """检测是否是markdown表格（|分隔）"""
+    if start_idx >= len(lines):
+        return False
+    line = lines[start_idx].strip()
+    # 检查是否是表格行（|分隔）
+    if "|" in line:
+        # 下一行应该是 --- 分隔行
+        if start_idx + 1 < len(lines):
+            next_line = lines[start_idx + 1].strip()
+            if next_line.startswith("|") and "---" in next_line:
+                return True
+    return False
+
+
+def parse_markdown_table(lines, start_idx):
+    """解析markdown表格，返回行列表和结束索引"""
+    table_rows = []
+    i = start_idx
+    # 跳过表头后的 --- 行
+    if i + 1 < len(lines) and "---" in lines[i + 1]:
+        i += 1
+
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line or "|" not in line:
+            break
+        # 解析表格行
+        cols = [c.strip() for c in line.split("|") if c.strip()]
+        if cols:
+            table_rows.append(cols)
+        i += 1
+
+    return table_rows, i - 1
+
+
+def clean_text(text):
+    """清理文本，移除多余空格、HTML标签和处理中文间隔问题"""
+    # 移除HTML标签
+    text = re.sub(r"<[^>]+>", "", text)
+    # 处理中文间隔问题：如果一个中文字和下一个中文字之间有空格，去掉
+    # 匹配中文和其他CJK字符，移除它们之间的空格
+    text = re.sub(r"([\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", r"\1", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1", text)
+    # 移除连续空格
+    text = re.sub(r" +", " ", text)
+    # 移除换行前后的空格
+    text = re.sub(r"\n\s+", "\n", text)
+    text = re.sub(r"\s+\n", "\n", text)
+    return text.strip()
+
+
+def add_formatted_paragraph(doc, text, font_size=11):
+    """添加段落，统一字体"""
+    text = clean_text(text)
+    if not text:
+        return
+    p = doc.add_paragraph()
+    run = p.add_run(text)
+    run.font.size = Pt(font_size)
+    run.font.name = "Times New Roman"
+    run._element.rPr.rFonts.set(docx.oxml.ns.qn("w:eastAsia"), "黑体")
+    return p
+
+
+def add_formatted_table(doc, rows, font_size=11):
+    """添加Word表格，统一字体"""
+    if not rows:
+        return
+
+    max_cols = max(len(row) for row in rows)
+    table = doc.add_table(rows=len(rows), cols=max_cols)
+    table.style = "Table Grid"
+
+    for i, row_data in enumerate(rows):
+        for j, cell_text in enumerate(row_data):
+            if j >= max_cols:
+                break
+            cell = table.cell(i, j)
+            cell.text = clean_text(cell_text)
+            # 设置单元格字体
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.size = Pt(font_size)
+                    run.font.name = "Times New Roman"
+                    run._element.rPr.rFonts.set(docx.oxml.ns.qn("w:eastAsia"), "黑体")
+
+
 def save_results_to_word(task):
     """保存结果到Word文档"""
     output_file = os.path.join(
@@ -358,11 +476,21 @@ def save_results_to_word(task):
     # 标题
     title = doc.add_heading(f"PDF识别结果 - {task['filename']}", 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in title.runs:
+        run.font.name = "Times New Roman"
+        run._element.rPr.rFonts.set(docx.oxml.ns.qn("w:eastAsia"), "黑体")
 
     # 文档信息
     info_para = doc.add_paragraph()
-    info_para.add_run(f"总页数: {task['total_pages']}").bold = True
-    info_para.add_run(f"\n模型: {task.get('model', 'N/A')}")
+    run1 = info_para.add_run(f"总页数: {task['total_pages']}")
+    run1.bold = True
+    run1.font.size = Pt(11)
+    run1.font.name = "Times New Roman"
+    run1._element.rPr.rFonts.set(docx.oxml.ns.qn("w:eastAsia"), "黑体")
+    run2 = info_para.add_run(f"\n模型: {task.get('model', 'N/A')}")
+    run2.font.size = Pt(11)
+    run2.font.name = "Times New Roman"
+    run2._element.rPr.rFonts.set(docx.oxml.ns.qn("w:eastAsia"), "黑体")
 
     doc.add_paragraph("─" * 50)
 
@@ -371,20 +499,36 @@ def save_results_to_word(task):
         # 页码标题
         page_heading = doc.add_heading(f"第 {page_num + 1} 页", level=1)
         page_heading.runs[0].font.size = Pt(12)
+        page_heading.runs[0].font.name = "Times New Roman"
+        page_heading.runs[0]._element.rPr.rFonts.set(
+            docx.oxml.ns.qn("w:eastAsia"), "黑体"
+        )
 
-        # 内容 - 统一字体大小
+        # 内容
         content = task["results"][page_num]
-        if content.startswith("[错误:") or content.startswith("[Error:"):
-            p = doc.add_paragraph(content)
-            p.runs[0].font.size = Pt(11)
+        if "[错误:" in content or "[Error:" in content or "识别失败" in content:
+            add_formatted_paragraph(doc, content)
         else:
+            # 解析内容，处理markdown表格
             lines = content.split("\n")
-            for line in lines:
-                line = line.strip()
-                if line:
-                    p = doc.add_paragraph(line)
-                    for run in p.runs:
-                        run.font.size = Pt(11)
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
+                if not line:
+                    i += 1
+                    continue
+
+                # 检查是否是表格开始
+                if is_markdown_table(lines, i):
+                    # 解析markdown表格
+                    table_rows, end_idx = parse_markdown_table(lines, i)
+                    if table_rows:
+                        add_formatted_table(doc, table_rows)
+                    i = end_idx + 1
+                else:
+                    # 非表格行
+                    add_formatted_paragraph(doc, line)
+                    i += 1
 
         doc.add_paragraph()
 
@@ -397,9 +541,33 @@ def save_results_to_word(task):
         raise e
 
 
+def save_results_to_markdown(task):
+    """保存结果到Markdown文件"""
+    output_file = os.path.join(
+        app.config["OUTPUT_FOLDER"],
+        f"{task['id']}_output.md",
+    )
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(f"# {task['filename']}\n\n")
+        f.write(f"**总页数**: {task['total_pages']}\n")
+        f.write(f"**模型**: {task.get('model', 'N/A')}\n\n")
+        f.write("---\n\n")
+
+        for page_num in sorted(task["results"].keys()):
+            f.write(f"## 第 {page_num + 1} 页\n\n")
+            f.write(clean_text(task["results"][page_num]))
+            f.write("\n\n---\n\n")
+
+    print(f"文件已保存: {output_file}")
+    return output_file
+
+
 def process_pdf(task_id, url, model_name, prompt):
     task = tasks[task_id]
     task["status"] = "running"
+    task["current_page"] = 0
+    task["stop_flag"] = False
 
     try:
         # 先测试模型是否支持图片
@@ -408,7 +576,11 @@ def process_pdf(task_id, url, model_name, prompt):
         test_base64 = base64.b64encode(test_img).decode("utf-8")
         test_result = call_vl_model(url, model_name, test_base64, "hi", max_retries=1)
 
-        if "不支持" in test_result or "does not support" in test_result:
+        if (
+            "不支持" in test_result
+            or "does not support" in test_result
+            or "Cannot read" in test_result
+        ):
             task["status"] = "error"
             task["errors"].append(f"模型 {model_name} 不支持图片输入，请使用VL模型")
             return
@@ -416,31 +588,65 @@ def process_pdf(task_id, url, model_name, prompt):
         print(f"  模型测试通过，开始处理...")
 
         for i in range(task["total_pages"]):
-            task["current_page"] = i
+            # 检查停止标志
+            if task.get("stop_flag"):
+                print(f"  用户停止处理，第{i + 1}页停止")
+                task["status"] = "stopped"
+                return
+
+            task["current_page"] = i + 1  # 1-indexed for display
 
             try:
                 img_bytes = extract_page_as_image(task["filepath"], i, scale=1.0)
                 img_base64 = base64.b64encode(img_bytes).decode("utf-8")
                 result = call_vl_model(url, model_name, img_base64, prompt)
 
-                if "图片处理失败" in result or "不支持" in result:
+                if (
+                    "图片处理失败" in result
+                    or "不支持" in result
+                    or "Cannot read" in result
+                ):
                     print(f"  第{i + 1}页处理失败，尝试更低清晰度...")
+                    if task.get("stop_flag"):
+                        task["status"] = "stopped"
+                        return
                     img_bytes = extract_page_as_image(task["filepath"], i, scale=0.75)
                     img_base64 = base64.b64encode(img_bytes).decode("utf-8")
                     result = call_vl_model(url, model_name, img_base64, prompt)
 
-                if "图片处理失败" in result or "不支持" in result:
+                if (
+                    "图片处理失败" in result
+                    or "不支持" in result
+                    or "Cannot read" in result
+                ):
                     print(f"  第{i + 1}页再次失败，尝试最低清晰度...")
+                    if task.get("stop_flag"):
+                        task["status"] = "stopped"
+                        return
                     img_bytes = extract_page_as_image(task["filepath"], i, scale=0.5)
                     img_base64 = base64.b64encode(img_bytes).decode("utf-8")
                     result = call_vl_model(url, model_name, img_base64, prompt)
 
-                # 检查是否是错误结果，如果是则标记为失败
-                if result.startswith("[错误:") or result.startswith("[Error:") or "不支持" in result or "does not support" in result:
-                    task["errors"].append(f"第{i + 1}页: {result}")
-                    task["results"][i] = f"[第{i+1}页识别失败]"
+                # 检查是否是错误结果
+                error_patterns = [
+                    "[错误:",
+                    "[Error:",
+                    "不支持",
+                    "does not support",
+                    "Cannot read",
+                    "图片处理失败",
+                ]
+                is_error = any(pattern in result for pattern in error_patterns)
+
+                if is_error:
+                    task["errors"].append(f"第{i + 1}页: {result[:100]}")
+                    task["results"][i] = f"[第{i + 1}页识别失败]"
                 else:
                     task["results"][i] = result
+
+            except Exception as e:
+                task["errors"].append(f"第{i + 1}页: {str(e)}")
+                task["results"][i] = f"[第{i + 1}页识别失败]"
 
             time.sleep(1.0)
 
@@ -482,6 +688,9 @@ HTML_TEMPLATE = """
         .btn-primary:disabled { background: #ccc; cursor: not-allowed; }
         .btn-success { background: #5cb85c; color: white; }
         .btn-success:hover { background: #4cae4c; }
+        .btn-danger { background: #d9534f; color: white; }
+        .btn-danger:hover { background: #c9302c; }
+        .btn-danger:disabled { background: #ccc; cursor: not-allowed; }
         
         .upload-area { border: 2px dashed #ddd; border-radius: 8px; padding: 40px; text-align: center; cursor: pointer; transition: all 0.2s; }
         .upload-area:hover { border-color: #4a90d9; background: #f8f8f8; }
@@ -576,7 +785,9 @@ HTML_TEMPLATE = """
         <div class="card">
             <div class="actions">
                 <button class="btn btn-primary" id="startBtn" onclick="startProcessing()" disabled>🚀 开始识别</button>
-                <button class="btn btn-success" id="downloadBtn" onclick="downloadResult()" style="display: none;">📥 下载结果</button>
+                <button class="btn btn-danger" id="stopBtn" onclick="stopProcessing()" style="display: none;">🛑 停止</button>
+                <button class="btn btn-success" id="downloadDocxBtn" onclick="downloadResult('docx')" style="display: none;">📥 下载Word</button>
+                <button class="btn btn-success" id="downloadMdBtn" onclick="downloadResult('md')" style="display: none;">📥 下载MD</button>
             </div>
             
             <div class="progress-container" id="progressContainer">
@@ -726,6 +937,7 @@ HTML_TEMPLATE = """
         function showProgress() {
             document.getElementById('progressContainer').classList.add('show');
             document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').style.display = 'inline-block';
             document.getElementById('statusBox').className = 'status running show';
             document.getElementById('statusBox').textContent = '处理中...';
             
@@ -762,12 +974,15 @@ HTML_TEMPLATE = """
                     if (data.status === 'completed') {
                         statusBox.className = 'status completed show';
                         statusBox.textContent = '处理完成！';
-                        document.getElementById('downloadBtn').style.display = 'inline-block';
+                        document.getElementById('stopBtn').style.display = 'none';
+                        document.getElementById('downloadDocxBtn').style.display = 'inline-block';
+                        document.getElementById('downloadMdBtn').style.display = 'inline-block';
                         document.getElementById('previewSection').classList.add('show');
                         loadPreview(0);
                     } else if (data.status === 'error') {
                         statusBox.className = 'status error show';
                         statusBox.textContent = '处理出错: ' + (data.errors || []).join(', ');
+                        document.getElementById('stopBtn').style.display = 'none';
                     } else {
                         statusBox.className = 'status running show';
                         statusBox.textContent = `处理中... ${data.progress}%`;
@@ -792,7 +1007,21 @@ HTML_TEMPLATE = """
         
         function prevPage() { if (lastPreviewPage > 0) loadPreview(lastPreviewPage - 1); }
         function nextPage() { loadPreview(lastPreviewPage + 1); }
-        function downloadResult() { window.location.href = `/api/download/${currentTaskId}`; }
+        function downloadResult(fmt) { window.location.href = `/api/download/${currentTaskId}?format=${fmt}`; }
+        
+        function stopProcessing() {
+            if (!currentTaskId) return;
+            
+            fetch(`/api/stop/${currentTaskId}`, { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        document.getElementById('stopBtn').disabled = true;
+                        document.getElementById('statusBox').textContent = '已停止';
+                        document.getElementById('statusBox').className = 'status error show';
+                    }
+                });
+        }
         
         window.onload = function() {
             loadModels();
